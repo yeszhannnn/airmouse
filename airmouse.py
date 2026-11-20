@@ -10,15 +10,19 @@ Gestures
   open palm, move up / down ............. scroll (with inertia)
   fist .................................. release the cursor / stop scrolling
 
-Hotkeys (work everywhere)
-  Ctrl+Alt+M  pause     Ctrl+Alt+V  show/hide camera window     Ctrl+Alt+Q  quit
-  (triple-tap Ctrl to start/stop is handled by launcher.py)
+Keys (work everywhere)
+  triple-tap Ctrl  on / off      Ctrl+Alt+V  camera window
+  Ctrl+Alt+M       pause         Ctrl+Alt+Q  off
 
-Threads
+One small resident process. While off it holds no camera and no models, so
+switching on only has to open the camera. Hand tracking runs Google's MediaPipe
+hand models directly on LiteRT (or OpenCV DNN), without the MediaPipe package.
+
+Threads while on
   camera    keeps only the newest frame (no queue = no lag)
-  tracking  MediaPipe + filters + gestures (independent of the preview window)
+  tracking  hand model + filters + gestures
   output    240 Hz: moves the cursor smoothly between camera frames
-  main      preview window only
+  main      control queue + preview window
 """
 
 from __future__ import annotations
@@ -1008,27 +1012,31 @@ class Engine:
 
 
 # =============================================================================
-#  CAMERA - own thread, newest frame only, auto-reconnect
+#  CAMERA - own thread, newest frame only, fast open, auto-reconnect
 # =============================================================================
+_GOOD_API = {}          # camera index -> backend that worked last time (fast re-open)
+
+
 class Camera(threading.Thread):
     def __init__(self, cfg: Config):
         super().__init__(daemon=True, name="camera")
         import cv2
         self.cv2, self.cfg = cv2, cfg
         self.is_file = not str(cfg.camera).isdigit()
-        self.cap = self._open()
-        if self.cap is None:
-            raise RuntimeError("Could not open camera %s (is another app using it?)" % cfg.camera)
+        self.cap = None
         self.cond = threading.Condition()
         self.frame, self.t, self.seq = None, 0.0, 0
         self.running = True
+        self.failed = False
         self.fps = 0.0
+        self.open_s = None          # how long the camera took to deliver frame #1
 
     def _open(self):
         cv2, cfg = self.cv2, self.cfg
         if self.is_file:
             cap = cv2.VideoCapture(str(cfg.camera))
             return cap if cap.isOpened() else None
+        idx = int(cfg.camera)
         if IS_WIN:
             apis = [cv2.CAP_DSHOW, cv2.CAP_MSMF]
         elif IS_MAC:
@@ -1036,24 +1044,38 @@ class Camera(threading.Thread):
         else:
             apis = [cv2.CAP_V4L2]
         apis.append(cv2.CAP_ANY)
-        for api in apis:
-            try:
-                cap = cv2.VideoCapture(int(cfg.camera), api)
-            except Exception:
-                continue
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.cam_width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.cam_height)
-                cap.set(cv2.CAP_PROP_FPS, cfg.cam_fps)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                ok, _ = cap.read()
-                if ok:
+        if idx in _GOOD_API:
+            apis.insert(0, _GOOD_API[idx])
+        # pass the format at open time: one negotiation with the driver instead of
+        # one per setting (this is most of the start-up time on Windows)
+        params = [cv2.CAP_PROP_FRAME_WIDTH, cfg.cam_width, cv2.CAP_PROP_FRAME_HEIGHT,
+                  cfg.cam_height, cv2.CAP_PROP_FPS, cfg.cam_fps]
+        for api in dict.fromkeys(apis):
+            if not self.running:
+                return None
+            for p in (params, None):
+                try:
+                    cap = cv2.VideoCapture(idx, api, p) if p else cv2.VideoCapture(idx, api)
+                except Exception:
+                    continue
+                if cap.isOpened():
+                    if p is None:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.cam_width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.cam_height)
+                        cap.set(cv2.CAP_PROP_FPS, cfg.cam_fps)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    _GOOD_API[idx] = api
                     return cap
-            cap.release()
+                cap.release()
         return None
 
     def run(self):
+        t0 = time.perf_counter()
+        self.cap = self._open()
+        if self.cap is None:
+            print("[camera] could not open camera %s (is another app using it?)" % self.cfg.camera)
+            self.failed = True
+            return
         last = None
         fails = 0
         while self.running:
@@ -1068,23 +1090,22 @@ class Camera(threading.Thread):
                 fails += 1
                 if fails > 30:                   # camera dropped out: reconnect
                     print("[camera] no frames, reconnecting...")
-                    try:
-                        self.cap.release()
-                    except Exception:
-                        pass
-                    cap = None
-                    while self.running and cap is None:
-                        cap = self._open()
-                        if cap is None:
+                    self.cap.release()
+                    self.cap = None
+                    while self.running and self.cap is None:
+                        self.cap = self._open()
+                        if self.cap is None:
                             time.sleep(1.0)
-                    if cap is not None:
-                        self.cap = cap
-                        print("[camera] back online")
+                    if self.cap is None:
+                        break
                     fails = 0
                 else:
                     time.sleep(0.01)
                 continue
             fails = 0
+            if self.open_s is None:
+                self.open_s = now - t0
+                print("[camera] first frame after %.2f s" % self.open_s)
             if last is not None:
                 inst = 1.0 / max(1e-3, now - last)
                 self.fps = inst if self.fps == 0 else 0.9 * self.fps + 0.1 * inst
@@ -1093,6 +1114,8 @@ class Camera(threading.Thread):
                 self.frame, self.t = fr, now
                 self.seq += 1
                 self.cond.notify_all()
+        if self.cap is not None:
+            self.cap.release()
 
     def latest(self, after_seq, timeout=0.5):
         with self.cond:
@@ -1106,7 +1129,12 @@ class Camera(threading.Thread):
 
 
 # =============================================================================
-#  HAND TRACKER (MediaPipe Tasks)
+#  HAND TRACKER - the MediaPipe hand pipeline, without the MediaPipe package
+#
+#  Same two Google models (palm detector + 21-point landmark model), run on
+#  LiteRT (XNNPACK) or, if that is unavailable, on OpenCV DNN. Tracking works
+#  like MediaPipe: the palm detector runs only until a hand is found; after that
+#  each frame's landmarks give the crop for the next frame.
 # =============================================================================
 def ensure_model():
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
@@ -1118,39 +1146,170 @@ def ensure_model():
     return MODEL_PATH
 
 
-class HandTracker:
-    def __init__(self):
-        import mediapipe as mp
-        from mediapipe.tasks import python as mpp
-        from mediapipe.tasks.python import vision
-        self.mp = mp
-        opts = vision.HandLandmarkerOptions(
-            base_options=mpp.BaseOptions(model_asset_path=ensure_model()),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
-            min_hand_detection_confidence=0.6,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self.lm = vision.HandLandmarker.create_from_options(opts)
-        self.last_ts = -1
+def _ssd_anchors():
+    out = []
+    for grid, n in ((24, 2), (12, 6)):          # 192x192 input, strides 8 and 16
+        for y in range(grid):
+            for x in range(grid):
+                out += [((x + 0.5) / grid, (y + 0.5) / grid)] * n
+    return np.array(out, dtype=np.float32)
 
-    def detect(self, rgb, t):
-        ts = int(t * 1000)
-        if ts <= self.last_ts:
-            ts = self.last_ts + 1
-        self.last_ts = ts
-        img = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
-        res = self.lm.detect_for_video(img, ts)
-        if not res.hand_landmarks:
+
+def _wrap_angle(a):
+    return a - 2 * math.pi * math.floor((a + math.pi) / (2 * math.pi))
+
+
+def _rect(cx, cy, w, h, rot, scale, shift_y):
+    """MediaPipe RectTransformation: shift along the hand axis, square, scale."""
+    cx += -h * shift_y * math.sin(rot)
+    cy += h * shift_y * math.cos(rot)
+    return (cx, cy, max(w, h) * scale, rot)
+
+
+def roi_from_palm(box, kp):
+    rot = _wrap_angle(math.pi / 2 - math.atan2(-(kp[2, 1] - kp[0, 1]), kp[2, 0] - kp[0, 0]))
+    return _rect(box[0], box[1], box[2], box[3], rot, 2.6, -0.5)
+
+
+def roi_from_landmarks(pts):
+    sel = pts[[0, 1, 2, 3, 5, 6, 9, 10, 13, 14, 17, 18]]
+    x1 = ((pts[5, 0] + pts[13, 0]) / 2 + pts[9, 0]) / 2
+    y1 = ((pts[5, 1] + pts[13, 1]) / 2 + pts[9, 1]) / 2
+    rot = _wrap_angle(math.pi / 2 - math.atan2(-(y1 - pts[0, 1]), x1 - pts[0, 0]))
+    c = (sel.min(0) + sel.max(0)) / 2
+    co, si = math.cos(-rot), math.sin(-rot)
+    rp = (sel - c) @ np.array([[co, -si], [si, co]]).T
+    lo, hi = rp.min(0), rp.max(0)
+    mid = (lo + hi) / 2
+    co, si = math.cos(rot), math.sin(rot)
+    ctr = np.array([[co, -si], [si, co]]) @ mid + c
+    return _rect(ctr[0], ctr[1], hi[0] - lo[0], hi[1] - lo[1], rot, 2.0, -0.1)
+
+
+class _LiteRT:
+    def __init__(self, data, threads):
+        from ai_edge_litert.interpreter import Interpreter
+        self.it = Interpreter(model_content=data, num_threads=threads)
+        self.it.allocate_tensors()
+        self.inp = self.it.get_input_details()[0]["index"]
+        self.outs = {d["name"]: d["index"] for d in self.it.get_output_details()}
+
+    def __call__(self, x):                      # x: NHWC float32
+        self.it.set_tensor(self.inp, x)
+        self.it.invoke()
+        return {k: self.it.get_tensor(i) for k, i in self.outs.items()}
+
+
+class _OpenCVDNN:
+    def __init__(self, data, threads):
+        import cv2
+        buf = np.frombuffer(data, np.uint8)
+        try:
+            self.net = cv2.dnn.readNetFromTFLite(buf, engine=cv2.dnn.ENGINE_CLASSIC)
+        except (AttributeError, TypeError):
+            self.net = cv2.dnn.readNetFromTFLite(buf)
+        self.names = self.net.getUnconnectedOutLayersNames()
+        cv2.setNumThreads(4)
+
+    def __call__(self, x):
+        self.net.setInput(np.ascontiguousarray(x.transpose(0, 3, 1, 2)))
+        return dict(zip(self.names, self.net.forward(self.names)))
+
+
+class HandTracker:
+    ANCHORS = None
+
+    def __init__(self, threads=2):
+        import zipfile
+        with zipfile.ZipFile(ensure_model()) as z:
+            det, lmk = z.read("hand_detector.tflite"), z.read("hand_landmarks_detector.tflite")
+        try:
+            self.det, self.lmk = _LiteRT(det, threads), _LiteRT(lmk, threads)
+            self.backend = "litert"
+        except Exception:
+            self.det, self.lmk = _OpenCVDNN(det, threads), _OpenCVDNN(lmk, threads)
+            self.backend = "opencv"
+        if HandTracker.ANCHORS is None:
+            HandTracker.ANCHORS = _ssd_anchors()
+        self.roi = None
+        self.n = 0
+
+    def reset(self):
+        self.roi = None
+
+    def _palm(self, bgr):
+        import cv2
+        h, w = bgr.shape[:2]
+        s = max(h, w)
+        k = 192.0 / s
+        rw, rh = int(round(w * k)), int(round(h * k))
+        canvas = np.zeros((192, 192, 3), np.uint8)
+        ox, oy = (192 - rw) // 2, (192 - rh) // 2
+        canvas[oy:oy + rh, ox:ox + rw] = cv2.resize(bgr, (rw, rh), interpolation=cv2.INTER_AREA)
+        x = canvas[None, :, :, ::-1].astype(np.float32) * (1.0 / 255.0)
+        out = self.det(x)
+        scores = boxes = None
+        for v in out.values():
+            if v.shape[-1] == 1:
+                scores = v.reshape(-1)
+            else:
+                boxes = v.reshape(-1, 18)
+        sc = 1.0 / (1.0 + np.exp(-np.clip(scores, -50, 50)))
+        idx = np.where(sc > 0.5)[0]
+        if len(idx) == 0:
             return None
-        return np.array([(q.x, q.y) for q in res.hand_landmarks[0]], dtype=float)
+        A = self.ANCHORS[idx]
+        b = boxes[idx] / 192.0
+        cx, cy, bw, bh = b[:, 0] + A[:, 0], b[:, 1] + A[:, 1], b[:, 2], b[:, 3]
+        kps = b[:, 4:].reshape(-1, 7, 2) + A[:, None, :]
+        s_ = sc[idx]
+        i = int(np.argmax(s_))
+        # weighted non-max suppression around the best box (one hand)
+        ix = np.clip(np.minimum(cx + bw / 2, cx[i] + bw[i] / 2) - np.maximum(cx - bw / 2, cx[i] - bw[i] / 2), 0, None)
+        iy = np.clip(np.minimum(cy + bh / 2, cy[i] + bh[i] / 2) - np.maximum(cy - bh / 2, cy[i] - bh[i] / 2), 0, None)
+        inter = ix * iy
+        m = inter / (bw * bh + bw[i] * bh[i] - inter + 1e-9) > 0.3
+        wt = s_[m] / s_[m].sum()
+        box = (np.stack([cx, cy, bw, bh], 1)[m] * wt[:, None]).sum(0)
+        kp = (kps[m] * wt[:, None, None]).sum(0)
+        # 192 canvas coords -> frame pixels
+        box = np.array([(box[0] * 192 - ox) / k, (box[1] * 192 - oy) / k, box[2] * 192 / k, box[3] * 192 / k])
+        kp = (kp * 192 - (ox, oy)) / k
+        return box, kp
+
+    def _landmarks(self, bgr, roi):
+        import cv2
+        cx, cy, s, rot = roi
+        c, si, k = math.cos(rot), math.sin(rot), s / 224.0
+        M = np.array([[c * k, -si * k, cx - (c - si) * 112 * k],
+                      [si * k, c * k, cy - (si + c) * 112 * k]], dtype=np.float32)
+        crop = cv2.warpAffine(bgr, M, (224, 224), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+        out = self.lmk(crop[None, :, :, ::-1].astype(np.float32) * (1.0 / 255.0))
+        presence = float(out["Identity_1"].ravel()[0])
+        uv = out["Identity"].reshape(21, 3)[:, :2]
+        pts = uv @ M[:, :2].T + M[:, 2]
+        return pts, presence
+
+    def detect(self, bgr):
+        """Returns 21 (x, y) landmarks normalized to the frame, or None."""
+        h, w = bgr.shape[:2]
+        self.n += 1
+        if self.roi is None:
+            if self.n % 2:                       # no hand: look for one at half rate
+                return None
+            d = self._palm(bgr)
+            if d is None:
+                return None
+            self.roi = roi_from_palm(*d)
+        pts, presence = self._landmarks(bgr, self.roi)
+        if presence < 0.5:
+            self.roi = None
+            return None
+        self.roi = roi_from_landmarks(pts)
+        return pts / (w, h)
 
     def close(self):
-        try:
-            self.lm.close()
-        except Exception:
-            pass
+        self.det = self.lmk = None
 
 
 # =============================================================================
@@ -1168,19 +1327,25 @@ class Processor(threading.Thread):
         self.want_view = cfg.preview
 
     def run(self):
-        import cv2
         seq = 0
         err_t = 0.0
+        idle_since = None
         while self.running:
             frame, t_cap, s = self.cam.latest(seq)
-            if frame is None or s == seq:
+            if frame is None or s == seq or not self.running:
                 continue
             seq = s
+            # hand resting (fist / no gesture) for a while: half the frame rate
+            if self.engine.pose in (FIST, OTHER):
+                idle_since = idle_since or t_cap
+                if t_cap - idle_since > 1.5 and s % 2:
+                    continue
+            else:
+                idle_since = None
             try:
                 t0 = time.perf_counter()
                 fh, fw = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                lm = self.tracker.detect(rgb, t_cap)
+                lm = self.tracker.detect(frame)
                 if lm is not None and self.cfg.mirror:
                     lm[:, 0] = 1.0 - lm[:, 0]       # mirror the points, not the image
                 st = self.engine.update(lm, t_cap, fw, fh)
@@ -1199,8 +1364,78 @@ class Processor(threading.Thread):
 
 
 # =============================================================================
-#  HOTKEYS
+#  HOTKEYS: Ctrl+Alt+<key> and triple-tap Ctrl
 # =============================================================================
+class TapDetector:
+    """Fires `callback` when Ctrl is tapped `taps` times quickly, on its own.
+
+    A tap = Ctrl pressed and released within `max_hold` s with no other key in
+    between, so Ctrl+C, Ctrl+V etc. never count.
+    """
+
+    def __init__(self, callback, taps=3, window=0.9, max_hold=0.35, cooldown=0.8,
+                 clock=time.monotonic):
+        self.callback, self.taps, self.window = callback, taps, window
+        self.max_hold, self.cooldown, self.clock = max_hold, cooldown, clock
+        self.times: list = []
+        self.down_t = None
+        self.dirty = False
+        self.last_fire = -1e9
+
+    def ctrl_down(self):
+        if self.down_t is None:          # ignore key auto-repeat
+            self.down_t = self.clock()
+            self.dirty = False
+
+    def ctrl_up(self):
+        if self.down_t is None:
+            return
+        now = self.clock()
+        held = now - self.down_t
+        self.down_t = None
+        if self.dirty or held > self.max_hold:
+            self.times.clear()
+            return
+        self.times = [t for t in self.times if now - t <= self.window] + [now]
+        if len(self.times) >= self.taps:
+            self.times.clear()
+            if now - self.last_fire >= self.cooldown:
+                self.last_fire = now
+                self.callback()
+
+    def other_key(self):
+        self.dirty = True
+        self.times.clear()
+
+
+def start_tap_listener(on_triple):
+    try:
+        from pynput import keyboard
+    except Exception as e:
+        print("[i] triple-Ctrl unavailable:", e)
+        return
+    K = keyboard.Key
+    ctrl = {K.ctrl, K.ctrl_l, K.ctrl_r}
+    det = TapDetector(on_triple)
+
+    def on_press(key):
+        if key in ctrl:
+            det.ctrl_down()
+        else:
+            det.other_key()
+
+    def on_release(key):
+        if key in ctrl:
+            det.ctrl_up()
+
+    lst = keyboard.Listener(on_press=on_press, on_release=on_release)
+    lst.daemon = True
+    lst.start()
+    if IS_MAC and getattr(lst, "IS_TRUSTED", True) is False:
+        print("[!] macOS blocked keyboard access: allow Python in System Settings > "
+              "Privacy & Security > Input Monitoring and Accessibility.")
+
+
 def start_hotkeys(actions):
     """actions: {'m': fn, 'v': fn, 'q': fn} -> Ctrl+Alt+<letter>."""
     if IS_WIN:
@@ -1218,10 +1453,7 @@ def start_hotkeys(actions):
             msg = wintypes.MSG()
             while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 if msg.message == 0x0312 and msg.wParam in ids:
-                    try:
-                        ids[msg.wParam]()
-                    except Exception as e:
-                        print("[hotkey] error:", e)
+                    ids[msg.wParam]()
         threading.Thread(target=loop, daemon=True, name="hotkeys").start()
         return
     try:
@@ -1233,6 +1465,63 @@ def start_hotkeys(actions):
         print("[i] Global hotkeys unavailable:", e)
 
 
+def chime(on: bool):
+    """Short sound so you know it switched, even with the camera window hidden."""
+    def play():
+        try:
+            if IS_WIN:
+                import winsound
+                winsound.MessageBeep(0x40 if on else 0x0)
+            elif IS_MAC:
+                import subprocess
+                snd = "/System/Library/Sounds/%s.aiff" % ("Tink" if on else "Pop")
+                subprocess.run(["afplay", snd], timeout=3)
+            else:
+                import subprocess
+                snd = "/usr/share/sounds/freedesktop/stereo/%s.oga" % (
+                    "device-added" if on else "device-removed")
+                if os.path.exists(snd):
+                    subprocess.run(["paplay", snd], timeout=3,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    threading.Thread(target=play, daemon=True).start()
+
+
+# =============================================================================
+#  CONTROL SOCKET (localhost): one instance, and `airmouse.py --toggle` etc.
+# =============================================================================
+PORT = 47615
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".airmouse")
+LOG_PATH = os.path.join(DATA_DIR, "airmouse.log")
+ARGS_FILE = os.path.join(DATA_DIR, "args.txt")     # permanent options, e.g. --speed 1.3
+
+
+def send(cmd: str, timeout: float = 1.0):
+    """Send a command to the running AirMouse. Returns its reply or None."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", PORT), timeout=timeout) as s:
+            s.sendall(cmd.encode() + b"\n")
+            return s.recv(256).decode().strip()
+    except OSError:
+        return None
+
+
+def _bind():
+    import socket
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if not IS_WIN:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", PORT))
+    except OSError:
+        srv.close()
+        return None
+    srv.listen(4)
+    return srv
+
+
 # =============================================================================
 #  PREVIEW
 # =============================================================================
@@ -1241,7 +1530,7 @@ HAND_EDGES = ((0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
               (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17))
 
 
-def draw_hud(cv2, img, lm, st, cfg, cam_fps, proc_ms, paused):
+def draw_hud(cv2, img, lm, st, cfg, cam_fps, proc_ms, paused, backend):
     h, w = img.shape[:2]
     if cfg.mode == "absolute":
         x0 = int((cfg.zone_cx - cfg.zone_w / 2) * w)
@@ -1270,7 +1559,8 @@ def draw_hud(cv2, img, lm, st, cfg, cam_fps, proc_ms, paused):
     elif st.get("scroll_state"):
         extra = "  " + st["scroll_state"]
     cv2.putText(img, pose + extra, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    info = "cam %2.0f fps | track %4.1f ms | %s x%.2f" % (cam_fps, proc_ms, cfg.mode, cfg.speed)
+    info = "cam %2.0f fps | track %4.1f ms (%s) | %s x%.2f" % (
+        cam_fps, proc_ms, backend, cfg.mode, cfg.speed)
     if "pinch" in st and st.get("pose") in (POSE_NAMES[POINT], POSE_NAMES[POINT2]):
         info += " | pinch %.2f" % st["pinch"]
     cv2.putText(img, info, (8, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1)
@@ -1280,10 +1570,197 @@ def draw_hud(cv2, img, lm, st, cfg, cam_fps, proc_ms, paused):
     return img
 
 
+def _starting_card(cv2, w, h):
+    img = np.full((h, w, 3), 24, np.uint8)
+    cv2.putText(img, "AirMouse: starting camera...", (w // 2 - 190, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    return img
+
+
+# =============================================================================
+#  APP - one resident process: OFF (no camera, models unloaded) <-> ON
+# =============================================================================
+class App:
+    WIN = "AirMouse"
+
+    def __init__(self, cfg: Config, srv):
+        import queue
+        self.cfg = cfg
+        self.q = queue.Queue()
+        self.mouse = make_mouse(cfg)
+        sw, sh = self.mouse.screen_size()
+        print("Screen: %dx%d" % (sw, sh))
+        self.out = Output(self.mouse, cfg)
+        self.out.start()
+        self.engine = Engine(cfg, self.out, sw, sh)
+        self.cam = self.proc = self.tracker = None
+        self.on = False
+        self.preview = cfg.preview
+        self.shown = False
+        self.last_seq = 0
+        self.backend = "-"
+        threading.Thread(target=self._serve, args=(srv,), daemon=True, name="ipc").start()
+        start_tap_listener(lambda: self.q.put("toggle"))
+        start_hotkeys({"m": lambda: self.q.put("pause"),
+                       "v": lambda: self.q.put("preview"),
+                       "q": lambda: self.q.put("off")})
+
+    # ---- control socket ----
+    def _serve(self, srv):
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    cmd = conn.recv(64).decode().strip()
+                    if cmd == "status":
+                        reply = "on" if self.on else "off"
+                    elif cmd == "ping":
+                        reply = "pong"
+                    elif cmd in ("toggle", "on", "off", "pause", "preview", "exit"):
+                        self.q.put(cmd)
+                        reply = "ok"
+                    else:
+                        reply = "?"
+                    conn.sendall(reply.encode() + b"\n")
+                except OSError:
+                    pass
+
+    # ---- on / off ----
+    def turn_on(self):
+        if self.on:
+            return
+        t0 = time.perf_counter()
+        self.tracker = HandTracker()
+        self.backend = self.tracker.backend
+        self.cam = Camera(self.cfg)
+        self.cam.start()                       # the camera opens in its own thread
+        self.engine.release_all()
+        self.proc = Processor(self.cfg, self.cam, self.tracker, self.engine)
+        self.proc.want_view = self.preview
+        self.proc.start()
+        self.on = True
+        chime(True)
+        print("ON  (models ready in %.0f ms, %s)" % ((time.perf_counter() - t0) * 1000, self.backend))
+
+    def turn_off(self):
+        if not self.on:
+            return
+        self.proc.running = False
+        self.cam.stop()
+        self.proc.join(timeout=1.0)
+        self.cam.join(timeout=2.0)
+        self.engine.release_all()
+        self.tracker.close()
+        self.cam = self.proc = self.tracker = None
+        self.on = False
+        self._hide()
+        import gc
+        gc.collect()                           # give the memory back while off
+        chime(False)
+        print("OFF")
+
+    # ---- preview ----
+    def _hide(self):
+        if self.shown:
+            import cv2
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+            self.shown = False
+
+    def _alive(self, cv2):
+        try:
+            return cv2.getWindowProperty(self.WIN, cv2.WND_PROP_VISIBLE) >= 1
+        except Exception:
+            return False
+
+    def _preview_tick(self):
+        import cv2
+        p = self.proc
+        p.want_view = True
+        with p.lock:
+            v, vs = p.view, p.view_seq
+        if v is None:
+            if not self.shown:                 # instant feedback while the camera starts
+                cv2.imshow(self.WIN, _starting_card(cv2, self.cfg.cam_width, self.cfg.cam_height))
+                self.shown = True
+            key = cv2.waitKey(10) & 0xFF
+        elif vs != self.last_seq:
+            self.last_seq = vs
+            frame, lm, st = v
+            img = cv2.flip(frame, 1) if self.cfg.mirror else frame.copy()
+            draw_hud(cv2, img, lm, st, self.cfg, self.cam.fps, p.proc_ms,
+                     self.engine.paused, self.backend)
+            cv2.imshow(self.WIN, img)
+            self.shown = True
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = cv2.waitKey(5) & 0xFF
+        if key in (ord("q"), 27):
+            self.q.put("off")
+        elif key == ord("p"):
+            self.q.put("pause")
+        elif key == ord("h"):
+            self.q.put("preview")
+        elif key == ord("c") and v is not None and v[1] is not None:
+            self.cfg.zone_cx, self.cfg.zone_cy = float(v[1][8, 0]), float(v[1][8, 1])
+        elif key in (ord("+"), ord("=")):
+            self.cfg.speed *= 1.15
+        elif key == ord("-"):
+            self.cfg.speed /= 1.15
+        if self.shown and not self._alive(cv2):     # closed with the X button
+            self.shown = False
+            self.preview = False
+            self.proc.want_view = False
+            print("Camera window hidden - AirMouse keeps running (Ctrl+Alt+V to show)")
+
+    # ---- main loop (main thread: GUI must live here on macOS) ----
+    def run(self, start_on):
+        import queue
+        if start_on:
+            self.turn_on()
+        while True:
+            busy = self.on and self.preview
+            try:
+                cmd = self.q.get(timeout=0 if busy else 0.25)
+            except queue.Empty:
+                cmd = None
+            if cmd == "exit":
+                break
+            elif cmd == "toggle":
+                self.turn_off() if self.on else self.turn_on()
+            elif cmd == "on":
+                self.turn_on()
+                if not self.preview:
+                    self.preview = True
+            elif cmd == "off":
+                self.turn_off()
+            elif cmd == "pause":
+                self.engine.set_paused(not self.engine.paused)
+            elif cmd == "preview":
+                self.preview = not self.preview
+                if self.proc:
+                    self.proc.want_view = self.preview
+                if not self.preview:
+                    self._hide()
+            if self.on and self.cam.failed:
+                self.turn_off()
+            if self.on and self.preview:
+                self._preview_tick()
+            elif self.shown:
+                self._hide()
+        self.turn_off()
+        self.out.stop()
+
+
 # =============================================================================
 #  MAIN
 # =============================================================================
 def parse_args(argv=None):
+    import shlex
     c = Config()
     ap = argparse.ArgumentParser(description="AirMouse - control your computer with hand gestures")
     ap.add_argument("--camera", default=c.camera, help="camera index (0, 1, ...) or a video file")
@@ -1299,12 +1776,20 @@ def parse_args(argv=None):
                     help="palm up = scroll up (like a mouse wheel)")
     ap.add_argument("--wheel-steps", action="store_true",
                     help="scroll in whole wheel notches (if an app scrolls weirdly)")
-    ap.add_argument("--no-preview", action="store_true", help="start without the camera window")
+    ap.add_argument("--no-preview", action="store_true", help="don't show the camera window")
     ap.add_argument("--width", type=int, default=c.cam_width)
     ap.add_argument("--height", type=int, default=c.cam_height)
     ap.add_argument("--fps", type=int, default=c.cam_fps)
-    ap.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)  # used by launcher.py
-    a = ap.parse_args(argv)
+    ap.add_argument("--background", action="store_true",
+                    help="start switched off (used at login); triple-tap Ctrl to turn on")
+    g = ap.add_argument_group("control a running AirMouse")
+    for name in ("toggle", "on", "off", "status", "exit"):
+        g.add_argument("--" + name, dest="cmd", action="store_const", const=name)
+    extra = []
+    if argv is None and os.path.exists(ARGS_FILE):
+        with open(ARGS_FILE, encoding="utf-8") as f:
+            extra = shlex.split(f.read(), posix=not IS_WIN)
+    a = ap.parse_args(extra + (sys.argv[1:] if argv is None else argv))
     c.camera, c.mode, c.speed, c.scroll_style = str(a.camera), a.mode, a.speed, a.scroll
     c.scroll_gain *= a.scroll_speed
     c.joystick_gain *= a.scroll_speed
@@ -1315,131 +1800,44 @@ def parse_args(argv=None):
     if a.smooth > 0:
         c.min_cutoff /= a.smooth
         c.deadband *= a.smooth
-    return c, a.managed
+    return c, a
+
+
+def _log_to_file():
+    """No console (pythonw / login item): write messages to ~/.airmouse/airmouse.log."""
+    if sys.stdout is not None and sys.stdout.isatty():
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    mode = "w" if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000 else "a"
+    f = open(LOG_PATH, mode, buffering=1, encoding="utf-8", errors="replace")
+    sys.stdout = sys.stderr = f
+    print("\n=== AirMouse %s ===" % time.ctime())
 
 
 def main(argv=None):
-    cfg, managed = parse_args(argv)
-    import cv2
+    cfg, a = parse_args(argv)
+    if a.cmd:                                   # talk to the running instance
+        r = send(a.cmd)
+        print(r if r else "AirMouse is not running.")
+        return
+    srv = _bind()
+    if srv is None:                             # already running: just switch it on
+        if not a.background:
+            send("on")
+            print("AirMouse is already running - switched it on.")
+        return
+    _log_to_file()
     windows_tuning()
-
-    mouse = make_mouse(cfg)
-    sw, sh = mouse.screen_size()
-    print("Screen: %dx%d" % (sw, sh))
-    tracker = HandTracker()
-    cam = Camera(cfg)
-    cam.start()
-    out = Output(mouse, cfg)
-    out.start()
-    engine = Engine(cfg, out, sw, sh)
-    proc = Processor(cfg, cam, tracker, engine)
-    proc.start()
-
-    state = {"quit": False, "preview": cfg.preview, "shown": False}
-
-    def toggle_pause():
-        engine.set_paused(not engine.paused)
-        print("Paused" if engine.paused else "Running")
-
-    def toggle_preview():
-        state["preview"] = not state["preview"]
-
-    def do_quit():
-        state["quit"] = True
-
-    if managed:
-        # launcher.py talks to us through stdin: "quit" (or a closed pipe) = exit
-        def stdin_loop():
-            try:
-                for line in sys.stdin:
-                    if line.strip() == "quit":
-                        break
-            except Exception:
-                pass
-            do_quit()
-        threading.Thread(target=stdin_loop, daemon=True, name="stdin").start()
-
-    start_hotkeys({"m": toggle_pause, "v": toggle_preview, "q": do_quit})
-    print("AirMouse is running.")
-    print("  Ctrl+Alt+M pause | Ctrl+Alt+V camera window | Ctrl+Alt+Q quit")
-    print("  You can close the camera window - AirMouse keeps working.")
-
-    win = "AirMouse"
-    last_seq = 0
+    app = App(cfg, srv)
+    print("AirMouse ready. Triple-tap Ctrl to turn on/off. "
+          "Ctrl+Alt+V camera window, Ctrl+Alt+M pause.")
     try:
-        while not state["quit"]:
-            want = state["preview"]
-            proc.want_view = want
-            if not want:
-                if state["shown"]:
-                    cv2.destroyAllWindows()
-                    cv2.waitKey(1)
-                    state["shown"] = False
-                time.sleep(0.05)
-                continue
-
-            with proc.lock:
-                v, vs = proc.view, proc.view_seq
-            if v is None or vs == last_seq:
-                cv2.waitKey(5)          # keep the window responsive
-                if state["shown"] and not _window_alive(cv2, win):
-                    _on_window_closed(state)
-                continue
-            last_seq = vs
-            frame, lm, st = v
-            img = cv2.flip(frame, 1) if cfg.mirror else frame.copy()
-            draw_hud(cv2, img, lm, st, cfg, cam.fps, proc.proc_ms, engine.paused)
-            cv2.imshow(win, img)
-            state["shown"] = True
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            elif key == ord("p"):
-                toggle_pause()
-            elif key == ord("h"):
-                _on_window_closed(state)
-            elif key == ord("c") and lm is not None:
-                cfg.zone_cx, cfg.zone_cy = float(lm[8, 0]), float(lm[8, 1])
-            elif key in (ord("+"), ord("=")):
-                cfg.speed *= 1.15
-                print("Speed: %.2f" % cfg.speed)
-            elif key == ord("-"):
-                cfg.speed /= 1.15
-                print("Speed: %.2f" % cfg.speed)
-            if not _window_alive(cv2, win):
-                _on_window_closed(state)
+        app.run(start_on=not a.background)
     except KeyboardInterrupt:
-        pass
+        app.turn_off()
     finally:
-        proc.running = False
-        engine.release_all()
-        time.sleep(0.05)
-        out.stop()
-        cam.stop()
-        proc.join(timeout=1.0)
-        tracker.close()
-        try:
-            cam.cap.release()
-        except Exception:
-            pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
+        srv.close()
         print("Bye.")
-
-
-def _window_alive(cv2, win):
-    try:
-        return cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) >= 1
-    except Exception:
-        return False
-
-
-def _on_window_closed(state):
-    state["preview"] = False
-    print("Camera window hidden - AirMouse keeps running. "
-          "Ctrl+Alt+V to show it again, Ctrl+Alt+Q to quit.")
 
 
 if __name__ == "__main__":

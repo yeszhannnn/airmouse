@@ -1,5 +1,6 @@
-mediapipe>=0.10.14
-opencv-contrib-python>=4.8   # GUI build; mediapipe needs this one
+opencv-python>=4.8
 numpy
 pynput>=1.7
 pyobjc-framework-Quartz; sys_platform == "darwin"
+# install.py also adds ai-edge-litert (fast model runtime) where a wheel exists;
+# without it AirMouse falls back to OpenCV DNN automatically.

@@ -28,3 +28,21 @@ def test_finger_hysteresis():
     p[8] = (0, -11.4)            # ratio 1.14: between thresholds
     assert am.finger_states(p, prev=[True, False, False, False])[0] is True
     assert am.finger_states(p, prev=[False, False, False, False])[0] is False
+
+
+def test_ssd_anchor_count():
+    assert am._ssd_anchors().shape == (2016, 2)     # MediaPipe palm detector layout
+
+
+def test_upright_hand_roi_has_no_rotation():
+    # synthetic upright hand: wrist at the bottom, fingers pointing up
+    pts = np.zeros((21, 2))
+    pts[0] = (100, 200)
+    for i, x in zip((5, 9, 13, 17), (80, 95, 110, 125)):
+        pts[i] = (x, 140)
+        pts[i + 1] = (x, 110)
+    for i in (1, 2, 3):
+        pts[i] = (70 - 5 * i, 190 - 15 * i)
+    cx, cy, size, rot = am.roi_from_landmarks(pts)
+    assert abs(rot) < 0.15
+    assert 85 < cx < 115 and size > 100

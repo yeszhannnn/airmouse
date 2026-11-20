@@ -12,5 +12,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install numpy pytest pyflakes
-      - run: python -m pyflakes airmouse.py launcher.py install.py
+      - run: python -m pyflakes airmouse.py install.py
       - run: python -m pytest -q

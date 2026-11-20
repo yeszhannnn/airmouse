@@ -8,9 +8,9 @@ Control your computer with hand gestures. Just a webcam and [MediaPipe Hands](ht
 
 1. **The webcam sees your hand.** MediaPipe tracks 21 points on it.
 2. **Gestures become mouse actions.** Point to move, pinch to click, open your palm to scroll.
-3. **Triple-tap <kbd>Ctrl</kbd> to turn it on or off.** It runs quietly in the background.
+3. **Triple-tap <kbd>Ctrl</kbd> to turn it on or off.** Instantly: it waits in the background with nothing loaded and no camera.
 
-Works on Windows, macOS and Linux. Needs Python 3.10+.
+Works on Windows, macOS and Linux. Needs Python 3.10+. No MediaPipe package needed: the hand models run directly on [LiteRT](https://ai.google.dev/edge/litert), so the install is small and each frame takes ~5 ms.
 
 ## Run it
 
@@ -20,7 +20,7 @@ cd airmouse
 python3 install.py
 ```
 
-Then triple-tap <kbd>Ctrl</kbd>. On Windows, run `python install.py`.
+It turns on right away. On Windows, run `python install.py`.
 
 ## Controls
 

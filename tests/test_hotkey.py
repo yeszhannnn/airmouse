@@ -2,7 +2,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from launcher import TapDetector  # noqa: E402
+from airmouse import TapDetector  # noqa: E402
 
 
 class Clock:
