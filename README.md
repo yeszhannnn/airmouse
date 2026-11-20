@@ -15,7 +15,7 @@ Works on Windows, macOS and Linux. Needs Python 3.10+.
 ## Run it
 
 ```
-git clone https://github.com/YOUR_USERNAME/airmouse.git
+git clone https://github.com/yeszhannnn/airmouse.git
 cd airmouse
 python3 install.py
 ```
